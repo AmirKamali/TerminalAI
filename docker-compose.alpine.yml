@@ -1,0 +1,56 @@
+services:
+  terminalai:
+    build:
+      context: .
+      dockerfile: Dockerfile.alpine
+    image: terminalai:alpine
+    container_name: terminalai-alpine
+    
+    # Mount current directory as workspace
+    volumes:
+      - .:/workspace
+      - ./terminalai.conf:/home/terminalai/.config/terminalai/terminalai.conf
+    
+    # Set working directory to the mounted workspace
+    working_dir: /workspace
+    
+    # Keep container running for interactive use
+    stdin_open: true
+    tty: true
+    
+    # Network mode for local Ollama access (if running on host)
+    network_mode: host
+    
+    # Environment variables
+    environment:
+      - TERMINALAI_CONFIG=/home/terminalai/.config/terminalai/terminalai.conf
+    
+    # Default command - start bash shell
+    command: /bin/bash
+    
+  # Optional: Include Ollama service for complete AI setup
+  ollama:
+    image: ollama/ollama:latest
+    container_name: terminalai-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+    
+    # GPU support (uncomment if you have NVIDIA GPU)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+volumes:
+  ollama_data:
+    driver: local
+
+networks:
+  default:
+    name: terminalai-network

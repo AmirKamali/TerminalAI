@@ -1,0 +1,118 @@
+# Test Dockerfile to reproduce GitHub Actions cross-compilation issues
+FROM ubuntu:24.04
+
+# Set environment to avoid interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install basic dependencies
+RUN apt-get update -qq && \
+    apt-get install -y \
+        curl \
+        build-essential \
+        pkg-config \
+        gcc-aarch64-linux-gnu \
+        g++-aarch64-linux-gnu \
+        crossbuild-essential-arm64 \
+        libc6-dev-arm64-cross \
+        libssl-dev \
+        git
+
+# Install Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Add ARM64 target
+RUN rustup target add aarch64-unknown-linux-gnu
+
+# Create a test workspace
+WORKDIR /test
+
+# Copy the project files
+COPY Cargo.toml Cargo.lock ./
+COPY src/ ./src/
+COPY cmd/ ./cmd/
+COPY terminalai.conf ./
+
+# Test script to demonstrate the issue and fix
+RUN echo '#!/bin/bash\n\
+set -e\n\
+\n\
+echo "🧪 Testing Cross-Compilation Issues in Docker"\n\
+echo "============================================="\n\
+echo ""\n\
+\n\
+echo "📋 Environment Information:"\n\
+echo "  OS: $(cat /etc/os-release | grep PRETTY_NAME | cut -d= -f2 | tr -d \\")"\n\
+echo "  Rust: $(rustc --version)"\n\
+echo "  Cross-compiler: $(aarch64-linux-gnu-gcc --version | head -1)"\n\
+echo "  OpenSSL: $(pkg-config --modversion openssl)"\n\
+echo ""\n\
+\n\
+echo "🔧 Setting up cross-compilation environment..."\n\
+export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="aarch64-linux-gnu-gcc"\n\
+export CC_aarch64_unknown_linux_gnu="aarch64-linux-gnu-gcc"\n\
+export CXX_aarch64_unknown_linux_gnu="aarch64-linux-gnu-g++"\n\
+export PKG_CONFIG_ALLOW_CROSS="1"\n\
+\n\
+echo ""\n\
+echo "❌ REPRODUCING THE ISSUE: Building with system OpenSSL"\n\
+echo "------------------------------------------------------"\n\
+echo "  This will fail with: fatal error: openssl/opensslconf.h: No such file or directory"\n\
+echo ""\n\
+\n\
+# Try the failing approach first\n\
+export OPENSSL_STATIC="1"\n\
+echo "🔨 Attempting build with OPENSSL_STATIC=1 (this should fail)..."\n\
+if timeout 60 cargo build --release --target aarch64-unknown-linux-gnu 2>&1; then\n\
+    echo "✅ Build succeeded unexpectedly!"\n\
+else\n\
+    echo "❌ Build failed as expected (OpenSSL header mismatch)"\n\
+fi\n\
+\n\
+echo ""\n\
+echo "✅ DEMONSTRATING THE FIX: Using vendored OpenSSL"\n\
+echo "------------------------------------------------"\n\
+echo "  This should succeed by building OpenSSL from source"\n\
+echo ""\n\
+\n\
+# Now try the working approach with vendored OpenSSL\n\
+echo "🔨 Building with vendored OpenSSL..."\n\
+if timeout 300 cargo build --release --target aarch64-unknown-linux-gnu --features vendored-openssl 2>&1; then\n\
+    echo "✅ Build succeeded with vendored OpenSSL!"\n\
+    \n\
+    # Verify the binary was created\n\
+    if [ -f "target/aarch64-unknown-linux-gnu/release/tai" ]; then\n\
+        echo "📦 Binary created successfully:"\n\
+        ls -la target/aarch64-unknown-linux-gnu/release/tai\n\
+        file target/aarch64-unknown-linux-gnu/release/tai\n\
+        echo ""\n\
+        echo "🎯 Binary details:"\n\
+        echo "  Size: $(stat -c%s target/aarch64-unknown-linux-gnu/release/tai) bytes"\n\
+        echo "  Type: $(file target/aarch64-unknown-linux-gnu/release/tai)"\n\
+        \n\
+        # Test other binaries too\n\
+        for binary in cp_ai grep_ai find_ai; do\n\
+            if [ -f "target/aarch64-unknown-linux-gnu/release/$binary" ]; then\n\
+                echo "  ✅ $binary: $(stat -c%s target/aarch64-unknown-linux-gnu/release/$binary) bytes"\n\
+            else\n\
+                echo "  ❌ $binary: not found"\n\
+            fi\n\
+        done\n\
+    fi\n\
+else\n\
+    echo "❌ Build still failed - showing last 50 lines of output:"\n\
+    timeout 300 cargo build --release --target aarch64-unknown-linux-gnu --features vendored-openssl 2>&1 | tail -50\n\
+fi\n\
+\n\
+echo ""\n\
+echo "🎯 Testing Summary:"\n\
+echo "  Problem: ARM64 cross-compiler cannot use x86_64 OpenSSL headers"\n\
+echo "  Solution: Use vendored OpenSSL or proper cross-compilation setup"\n\
+echo ""\n\
+' > /test/test_cross_compilation.sh
+
+# Make the test script executable
+RUN chmod +x /test/test_cross_compilation.sh
+
+# Set the default command to run our test
+CMD ["/test/test_cross_compilation.sh"]

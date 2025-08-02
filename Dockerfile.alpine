@@ -1,0 +1,141 @@
+# Multi-stage Dockerfile for Terminal AI on Alpine Linux
+# This creates a lightweight Alpine image with all Terminal AI commands ready to use
+
+# Stage 1: Build stage
+FROM rust:1.82-alpine AS builder
+
+# Install build dependencies
+RUN apk add --no-cache \
+    musl-dev \
+    openssl-dev \
+    openssl-libs-static \
+    pkgconfig \
+    gcc \
+    g++ \
+    libc-dev \
+    git
+
+# Set environment variables for static linking
+ENV OPENSSL_STATIC=1
+ENV OPENSSL_LIB_DIR=/usr/lib
+ENV OPENSSL_INCLUDE_DIR=/usr/include
+ENV PKG_CONFIG_ALL_STATIC=1
+ENV RUSTFLAGS="-C target-feature=+crt-static"
+
+# Add the musl target for current architecture
+RUN rustup target add $(rustc --version --verbose | grep host | cut -d' ' -f2 | sed 's/gnu/musl/')
+
+# Create app directory
+WORKDIR /app
+
+# Copy project files
+COPY Cargo.toml Cargo.lock ./
+COPY src/ ./src/
+COPY cmd/ ./cmd/
+COPY terminalai.conf ./
+
+# Build all binaries in release mode with static linking for current architecture
+RUN TARGET=$(rustc --version --verbose | grep host | cut -d' ' -f2 | sed 's/gnu/musl/') && \
+    cargo build --release --target $TARGET
+
+# Stage 2: Runtime stage
+FROM alpine:3.19
+
+# Install minimal runtime dependencies
+RUN apk add --no-cache \
+    ca-certificates \
+    curl \
+    bash \
+    findutils \
+    grep \
+    coreutils
+
+# Create a non-root user
+RUN addgroup -g 1000 terminalai && \
+    adduser -D -s /bin/bash -u 1000 -G terminalai terminalai
+
+# Create directories
+RUN mkdir -p /usr/local/bin /home/terminalai/.config/terminalai
+
+# Copy binaries from builder stage (using a wildcard pattern to match any musl target)
+COPY --from=builder /app/target/*/release/tai /usr/local/bin/
+COPY --from=builder /app/target/*/release/cp_ai /usr/local/bin/
+COPY --from=builder /app/target/*/release/grep_ai /usr/local/bin/
+COPY --from=builder /app/target/*/release/find_ai /usr/local/bin/
+
+# Copy configuration file
+COPY --from=builder /app/terminalai.conf /usr/local/bin/
+COPY --from=builder /app/terminalai.conf /home/terminalai/.config/terminalai/
+
+# Make binaries executable
+RUN chmod +x /usr/local/bin/tai \
+             /usr/local/bin/cp_ai \
+             /usr/local/bin/grep_ai \
+             /usr/local/bin/find_ai
+
+# Set ownership
+RUN chown -R terminalai:terminalai /home/terminalai
+
+# Add helpful aliases and environment setup
+RUN echo 'alias ll="ls -la"' >> /etc/profile && \
+    echo 'alias la="ls -la"' >> /etc/profile && \
+    echo 'export PATH="/usr/local/bin:$PATH"' >> /etc/profile
+
+# Create a startup script that shows available commands
+RUN echo '#!/bin/bash' > /usr/local/bin/terminalai-help && \
+    echo 'echo "🤖 Terminal AI - Alpine Linux Edition"' >> /usr/local/bin/terminalai-help && \
+    echo 'echo "======================================"' >> /usr/local/bin/terminalai-help && \
+    echo 'echo ""' >> /usr/local/bin/terminalai-help && \
+    echo 'echo "Available AI-powered commands (global - work from any directory):"' >> /usr/local/bin/terminalai-help && \
+    echo 'echo "  tai  - Main Terminal AI interface"' >> /usr/local/bin/terminalai-help && \
+    echo 'echo "  cp_ai        - AI-powered copy operations"' >> /usr/local/bin/terminalai-help && \
+    echo 'echo "  grep_ai      - AI-powered search operations"' >> /usr/local/bin/terminalai-help && \
+    echo 'echo "  find_ai      - AI-powered file finding"' >> /usr/local/bin/terminalai-help && \
+    echo 'echo ""' >> /usr/local/bin/terminalai-help && \
+    echo 'echo "💡 Like standard Linux commands (ls, cd, grep), these work from any directory!"' >> /usr/local/bin/terminalai-help && \
+    echo 'echo ""' >> /usr/local/bin/terminalai-help && \
+    echo 'echo "Configuration:"' >> /usr/local/bin/terminalai-help && \
+    echo 'echo "  Config file: /usr/local/bin/terminalai.conf"' >> /usr/local/bin/terminalai-help && \
+    echo 'echo "  User config: ~/.config/terminalai/terminalai.conf"' >> /usr/local/bin/terminalai-help && \
+    echo 'echo ""' >> /usr/local/bin/terminalai-help && \
+    echo 'echo "Examples:"' >> /usr/local/bin/terminalai-help && \
+    echo 'echo "  cp_ai '\''copy all .txt files to /backup'\''"' >> /usr/local/bin/terminalai-help && \
+    echo 'echo "  grep_ai '\''find TODO comments in Python files'\''"' >> /usr/local/bin/terminalai-help && \
+    echo 'echo "  find_ai '\''locate large files over 100MB'\''"' >> /usr/local/bin/terminalai-help && \
+    echo 'echo ""' >> /usr/local/bin/terminalai-help && \
+    echo 'echo "To get started:"' >> /usr/local/bin/terminalai-help && \
+    echo 'echo "  1. Configure your AI provider in terminalai.conf"' >> /usr/local/bin/terminalai-help && \
+    echo 'echo "  2. If using Ollama: ensure it'\''s running and accessible"' >> /usr/local/bin/terminalai-help && \
+    echo 'echo "  3. Try: tai --help"' >> /usr/local/bin/terminalai-help && \
+    echo 'echo ""' >> /usr/local/bin/terminalai-help
+
+RUN chmod +x /usr/local/bin/terminalai-help
+
+# Create directory for potential volume mounts
+RUN mkdir -p /workspace && chown terminalai:terminalai /workspace
+
+# Switch to non-root user
+USER terminalai
+WORKDIR /home/terminalai
+
+# Set environment variables
+ENV PATH="/usr/local/bin:$PATH"
+ENV TERMINALAI_CONFIG="/home/terminalai/.config/terminalai/terminalai.conf"
+
+# Add helpful message to .bashrc
+RUN echo 'echo "🤖 Terminal AI ready! Type '\''terminalai-help'\'' for available commands."' >> ~/.bashrc
+
+# Health check to verify binaries work
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD tai --help > /dev/null || exit 1
+
+# Default command shows help
+CMD ["terminalai-help"]
+
+# Labels for metadata
+LABEL maintainer="Terminal AI Contributors"
+LABEL version="1.0"
+LABEL description="Terminal AI - AI-powered Linux commands on Alpine Linux"
+LABEL org.opencontainers.image.source="https://github.com/username/terminalai"
+LABEL org.opencontainers.image.description="Lightweight Alpine Linux image with Terminal AI commands ready to use"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
