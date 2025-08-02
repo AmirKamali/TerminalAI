@@ -1,0 +1,6 @@
+# Cross.toml - Minimal configuration for cross-compilation
+# This file provides the minimal configuration needed for the cross tool
+
+[build]
+# Use minimal configuration to avoid unused key warnings
+default-target = "x86_64-unknown-linux-gnu"

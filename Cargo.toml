@@ -1,0 +1,62 @@
+[package]
+name = "terminalai"
+version = "0.1.0"
+edition = "2021"
+description = "AI-powered Linux commands for enhanced terminal experience"
+license = "Apache-2.0"
+authors = ["Terminal AI Contributors"]
+repository = "https://github.com/username/terminalai"
+
+[[bin]]
+name = "tai"
+path = "src/main.rs"
+
+[[bin]]
+name = "cp_ai"
+path = "src/bin/cp_ai.rs"
+
+[[bin]]
+name = "grep_ai"
+path = "src/bin/grep_ai.rs"
+
+[[bin]]
+name = "find_ai"
+path = "src/bin/find_ai.rs"
+
+[[bin]]
+name = "resolve_ai"
+path = "src/bin/resolve_ai.rs"
+
+[[bin]]
+name = "ps_ai"
+path = "src/bin/ps_ai.rs"
+
+[dependencies]
+clap = { version = "4.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+reqwest = { version = "0.11", features = ["json", "stream", "blocking"] }
+anyhow = "1.0"
+dirs = "5.0"
+base64 = "0.21"
+async-trait = "0.1"
+colored = "2.0"
+futures-util = "0.3"
+zip = "0.6"
+tar = "0.4"
+flate2 = "1.0"
+
+# Optional dependencies for cross-compilation
+openssl = { version = "0.10", optional = true }
+
+[features]
+default = []
+# Feature for cross-compilation with vendored OpenSSL
+vendored-openssl = ["openssl/vendored", "reqwest/native-tls-vendored"]
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3.0"
+mockito = "1.0"
+assert_matches = "1.5"

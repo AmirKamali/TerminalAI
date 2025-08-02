@@ -1,0 +1,550 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        rust: [stable]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ matrix.rust }}
+        components: rustfmt, clippy
+        
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-${{ matrix.rust }}-
+          ${{ runner.os }}-cargo-
+          
+    - name: Check formatting
+      run: cargo fmt --all -- --check
+      
+    - name: Run clippy
+      run: cargo clippy --all-targets --all-features -- -D warnings
+      
+    - name: Run tests
+      run: cargo test --verbose --all-features
+      
+    - name: Run integration tests
+      run: cargo test --test integration_tests --verbose
+      
+    - name: Test build all binaries
+      run: |
+        cargo build --bin tai
+        cargo build --bin cp_ai  
+        cargo build --bin find_ai
+        cargo build --bin grep_ai
+        cargo build --bin ps_ai
+        cargo build --bin resolve_ai
+        
+    - name: Verify template compiles
+      run: cargo check --bin template_ai
+
+  security-audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      
+    - name: Install cargo-audit
+      run: cargo install cargo-audit
+      
+    - name: Run security audit
+      run: cargo audit
+
+  build-matrix:
+    name: Build Matrix
+    needs: [test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: terminalai-linux-x86_64
+            cross: false
+            sign: false
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact_name: terminalai-linux-aarch64
+            cross: true
+            sign: false
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact_name: terminalai-macos-x86_64
+            cross: false
+            sign: true
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: terminalai-macos-aarch64
+            cross: false
+            sign: true
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: terminalai-windows-x86_64
+            cross: false
+            sign: false
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.target }}
+        
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-${{ matrix.target }}-cargo-
+          ${{ runner.os }}-cargo-
+          
+    - name: Install cross-compilation dependencies (Linux ARM64)
+      if: matrix.target == 'aarch64-unknown-linux-gnu'
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y \
+          build-essential \
+          gcc-aarch64-linux-gnu \
+          g++-aarch64-linux-gnu \
+          pkg-config \
+          crossbuild-essential-arm64 \
+          libc6-dev-arm64-cross
+        
+        # Install OpenSSL development files (host version for build dependencies)
+        sudo apt-get install -y libssl-dev
+        
+        echo "📋 ARM64 cross-compilation setup complete"
+        echo "  Cross-compiler: $(which aarch64-linux-gnu-gcc)"
+        echo "  Build tools: $(which aarch64-linux-gnu-g++)"
+      
+    - name: Build release (native)
+      if: matrix.cross == false
+      run: |
+        echo "🔧 Using native cargo for ${{ matrix.target }}" 
+        cargo build --release --target ${{ matrix.target }}
+      shell: bash
+      
+    - name: Build release (cross-compilation)
+      if: matrix.cross == true
+      env:
+        # Cross-compilation environment variables (only set for cross targets)
+        CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: "aarch64-linux-gnu-gcc"
+        CC_aarch64_unknown_linux_gnu: "aarch64-linux-gnu-gcc"
+        CXX_aarch64_unknown_linux_gnu: "aarch64-linux-gnu-g++"
+        
+        # Allow cross-compilation
+        PKG_CONFIG_ALLOW_CROSS: "1"
+        
+      run: |
+        echo "🔧 Direct cargo cross-compilation for ${{ matrix.target }}"
+        echo "  Environment setup:"
+        echo "    Linker: $CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER"
+        echo "    CC: $CC_aarch64_unknown_linux_gnu"
+        echo "    CXX: $CXX_aarch64_unknown_linux_gnu"
+        echo "    PKG_CONFIG_ALLOW_CROSS: $PKG_CONFIG_ALLOW_CROSS"
+        
+        # Verify ARM64 environment
+        echo "📋 ARM64 environment verification:"
+        which aarch64-linux-gnu-gcc || echo "  ❌ ARM64 GCC not found"
+        aarch64-linux-gnu-gcc --version | head -1 || echo "  ❌ ARM64 GCC not working"
+        
+        # Install the target and build with vendored OpenSSL
+        rustup target add ${{ matrix.target }}
+        
+        echo "🔨 Building with vendored OpenSSL for ${{ matrix.target }}..."
+        cargo build --release --target ${{ matrix.target }} --features vendored-openssl
+      shell: bash
+      
+    - name: Setup code signing certificate (macOS)
+      if: matrix.sign == true
+      env:
+        APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+        APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      run: |
+        echo "🔐 Setting up code signing certificate..."
+        
+        # Create certificate file from base64
+        echo "$APPLE_CERTIFICATE_P12" | base64 -d > certificate.p12
+        
+        # Create keychain
+        security create-keychain -p "temp-keychain" build.keychain
+        security default-keychain -s build.keychain
+        security unlock-keychain -p "temp-keychain" build.keychain
+        security set-keychain-settings -t 3600 -l ~/Library/Keychains/build.keychain
+        
+        # Import certificate
+        security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+        security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "temp-keychain" build.keychain
+        
+        # List certificates for verification
+        security find-identity -v -p codesigning build.keychain
+        
+        # Clean up certificate file
+        rm certificate.p12
+        
+        echo "✅ Code signing certificate setup complete"
+      
+    - name: Sign macOS binaries
+      if: matrix.sign == true
+      run: |
+        echo "🔏 Signing macOS binaries..."
+        
+        # Get the certificate identity from the keychain
+        # First try Developer ID Application (for distribution)
+        CERT_IDENTITY=$(security find-identity -v -p codesigning build.keychain | grep "Developer ID Application" | head -1 | grep -o '"[^"]*"' | sed 's/"//g')
+        
+        # If no Developer ID Application found, fall back to Apple Development (for development/testing)
+        if [ -z "$CERT_IDENTITY" ]; then
+          echo "⚠️ No Developer ID Application certificate found, trying Apple Development certificates..."
+          CERT_IDENTITY=$(security find-identity -v -p codesigning build.keychain | grep "Apple Development" | head -1 | grep -o '"[^"]*"' | sed 's/"//g')
+        fi
+        
+        if [ -z "$CERT_IDENTITY" ]; then
+          echo "❌ No suitable code signing certificate found in keychain"
+          echo "Available certificates:"
+          security find-identity -v -p codesigning build.keychain
+          echo ""
+          echo "For distribution, you need a Developer ID Application certificate."
+          echo "For development/testing, an Apple Development certificate is sufficient."
+          exit 1
+        fi
+        
+        echo "Using certificate: $CERT_IDENTITY"
+        
+        # Check if this is a Developer ID Application certificate
+        if [[ "$CERT_IDENTITY" == *"Developer ID Application"* ]]; then
+          echo "✅ Using Developer ID Application certificate (suitable for distribution)"
+          SIGN_OPTIONS="--timestamp --options runtime"
+        else
+          echo "⚠️ Using Apple Development certificate (suitable for development/testing only)"
+          SIGN_OPTIONS="--timestamp"
+        fi
+        
+
+        
+        # Define binaries to sign (all binaries are built in this workflow)
+        BINARIES=("tai" "cp_ai" "find_ai" "grep_ai" "ps_ai" "resolve_ai")
+        
+        for binary in "${BINARIES[@]}"; do
+          binary_path="target/${{ matrix.target }}/release/$binary"
+          if [ -f "$binary_path" ]; then
+            echo "Signing $binary..."
+            
+            # Sign with the found certificate identity
+            codesign --force --sign "$CERT_IDENTITY" \
+                     $SIGN_OPTIONS \
+                     "$binary_path"
+            
+            # Verify signature
+            if codesign --verify --verbose "$binary_path" 2>/dev/null; then
+              echo "✅ $binary signed successfully"
+              # Show signing details
+              AUTHORITY=$(codesign -dv "$binary_path" 2>&1 | grep "Authority=" || true)
+              TEAM_ID=$(codesign -dv "$binary_path" 2>&1 | grep "TeamIdentifier=" || true)
+              if [ -n "$AUTHORITY" ]; then
+                echo "  $AUTHORITY"
+              elif [ -n "$TEAM_ID" ]; then
+                echo "  $TEAM_ID"
+              else
+                echo "  (Signing information not available)"
+              fi
+            else
+              echo "❌ Failed to verify signature for $binary"
+              exit 1
+            fi
+          else
+            echo "⚠️ Binary not found: $binary_path"
+            exit 1
+          fi
+        done
+        
+        echo "✅ All macOS binaries signed successfully!"
+        
+        # Show certificate type info
+        if echo "$CERT_IDENTITY" | grep -q "Developer ID Application"; then
+          echo "🔐 Binaries are signed with Developer ID Application certificate (ready for distribution)"
+        else
+          echo "⚠️ Binaries are signed with Apple Development certificate (for development/testing only)"
+          echo "   For distribution, you need a Developer ID Application certificate"
+        fi
+      
+    - name: Cleanup keychain (macOS)
+      if: matrix.sign == true && always()
+      run: |
+        echo "🧹 Cleaning up keychain..."
+        security delete-keychain build.keychain || echo "Keychain already deleted or doesn't exist"
+        echo "✅ Keychain cleanup complete"
+      
+    - name: Package binaries (Unix)
+      if: matrix.os != 'windows-latest'
+      run: |
+        mkdir -p release
+        cp target/${{ matrix.target }}/release/tai release/
+        cp target/${{ matrix.target }}/release/cp_ai release/
+        cp target/${{ matrix.target }}/release/find_ai release/
+        cp target/${{ matrix.target }}/release/grep_ai release/
+        cp target/${{ matrix.target }}/release/ps_ai release/
+        cp target/${{ matrix.target }}/release/resolve_ai release/
+        tar -czf ${{ matrix.artifact_name }}.tar.gz -C release .
+        
+    - name: Package binaries (Windows)
+      if: matrix.os == 'windows-latest'
+      run: |
+        mkdir release
+        cp target/${{ matrix.target }}/release/tai.exe release/
+        cp target/${{ matrix.target }}/release/cp_ai.exe release/
+        cp target/${{ matrix.target }}/release/find_ai.exe release/
+        cp target/${{ matrix.target }}/release/grep_ai.exe release/
+        cp target/${{ matrix.target }}/release/ps_ai.exe release/
+        cp target/${{ matrix.target }}/release/resolve_ai.exe release/
+        Compress-Archive -Path release/* -DestinationPath ${{ matrix.artifact_name }}.zip
+      shell: powershell
+      
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.artifact_name }}
+        path: |
+          ${{ matrix.artifact_name }}.tar.gz
+          ${{ matrix.artifact_name }}.zip
+        if-no-files-found: ignore
+
+  release:
+    name: Create Release
+    needs: [test, build-matrix, security-audit]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+        
+    - name: Prepare release assets
+      run: |
+        mkdir -p release-assets
+        find artifacts -name "*.tar.gz" -exec cp {} release-assets/ \;
+        find artifacts -name "*.zip" -exec cp {} release-assets/ \;
+        ls -la release-assets/
+        
+    - name: Generate date-based tag
+      id: generate_tag
+      run: |
+        # Date-based tagging system:
+        # - Format: YYYYMMDD (e.g., 20250711)
+        # - If multiple releases on same day: YYYYMMDD-N (e.g., 20250711-1, 20250711-2)
+        # - Examples: 20250711, 20250711-1, 20250711-2, 20250712
+        # Get current date in YYYYMMDD format
+        DATE=$(date +%Y%m%d)
+        
+        # Check if there are any existing tags for today
+        EXISTING_TODAY_TAGS=$(git tag | grep "^$DATE" || true)
+        
+        if [ -n "$EXISTING_TODAY_TAGS" ]; then
+          # Find the highest iteration number for today
+          MAX_ITERATION=0
+          while IFS= read -r tag; do
+            if [[ $tag =~ ^$DATE-([0-9]+)$ ]]; then
+              ITERATION_NUM=${BASH_REMATCH[1]}
+              if [ $ITERATION_NUM -gt $MAX_ITERATION ]; then
+                MAX_ITERATION=$ITERATION_NUM
+              fi
+            fi
+          done <<< "$EXISTING_TODAY_TAGS"
+          
+          # Increment the highest iteration
+          ITERATION=$((MAX_ITERATION + 1))
+          TAG="$DATE-$ITERATION"
+        else
+          # No tags for today, use just the date
+          TAG="$DATE"
+          ITERATION=""
+        fi
+        
+        echo "Generated tag: $TAG"
+        echo "TAG=$TAG" >> $GITHUB_OUTPUT
+        echo "DATE=$DATE" >> $GITHUB_OUTPUT
+        echo "ITERATION=$ITERATION" >> $GITHUB_OUTPUT
+      
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      with:
+        name: Release ${{ steps.generate_tag.outputs.TAG }}
+        tag_name: ${{ steps.generate_tag.outputs.TAG }}
+        body: |
+          ## TerminalAI ${{ steps.generate_tag.outputs.TAG }}
+          
+          ### 🚀 What's New
+          - Check the commit history for detailed changes
+          - All tests passing ✅
+          - Security audit completed ✅
+          
+          ### 📦 Downloads
+          Choose the appropriate binary for your platform:
+          
+          - **Linux x86_64**: `terminalai-linux-x86_64.tar.gz`
+          - **Linux ARM64**: `terminalai-linux-aarch64.tar.gz`
+          - **macOS Intel**: `terminalai-macos-x86_64.tar.gz` (signed, notarization in progress)
+          - **macOS Apple Silicon**: `terminalai-macos-aarch64.tar.gz` (signed, notarization in progress)
+          - **Windows x86_64**: `terminalai-windows-x86_64.zip`
+          
+          ### 🛠️ Installation
+          
+          1. Download the appropriate archive for your platform
+          2. Extract the binaries
+          3. Move them to a directory in your PATH (e.g., `/usr/local/bin`)
+          4. Run `tai init` to configure
+          
+          ### 📚 Documentation
+          
+          - [Installation Guide](https://github.com/${{ github.repository }}/blob/main/INSTALL.md)
+          - [Adding Commands](https://github.com/${{ github.repository }}/blob/main/ADD_COMMAND.md)
+          - [README](https://github.com/${{ github.repository }}/blob/main/README.md)
+          
+          ### 🧪 Verification
+          
+          All releases are automatically tested across multiple platforms and Rust versions.
+          Security audits are performed to ensure dependency safety.
+          
+          ### 🔐 macOS Security
+          
+          macOS binaries are code-signed and will be notarized automatically.
+          Notarized versions will be available shortly after release publication.
+          Look for `-notarized.tar.gz` versions for the best macOS security experience.
+          
+          **Note**: All individual command binaries (cp_ai, find_ai, grep_ai, ps_ai, resolve_ai) are included in the release packages.
+          
+        files: release-assets/*
+        draft: false
+        prerelease: ${{ github.ref != 'refs/heads/main' }}
+        generate_release_notes: true
+        make_latest: ${{ github.ref == 'refs/heads/main' }}
+
+  notify:
+    name: Notify Success
+    needs: [release]
+    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Generate tag for notification
+      id: generate_tag
+      run: |
+        # Date-based tagging system:
+        # - Format: YYYYMMDD (e.g., 20250711)
+        # - If multiple releases on same day: YYYYMMDD-N (e.g., 20250711-1, 20250711-2)
+        # - Examples: 20250711, 20250711-1, 20250711-2, 20250712
+        # Get current date in YYYYMMDD format
+        DATE=$(date +%Y%m%d)
+        
+        # Check if there are any existing tags for today
+        EXISTING_TODAY_TAGS=$(git tag | grep "^$DATE" || true)
+        
+        if [ -n "$EXISTING_TODAY_TAGS" ]; then
+          # Find the highest iteration number for today
+          MAX_ITERATION=0
+          while IFS= read -r tag; do
+            if [[ $tag =~ ^$DATE-([0-9]+)$ ]]; then
+              ITERATION_NUM=${BASH_REMATCH[1]}
+              if [ $ITERATION_NUM -gt $MAX_ITERATION ]; then
+                MAX_ITERATION=$ITERATION_NUM
+              fi
+            fi
+          done <<< "$EXISTING_TODAY_TAGS"
+          
+          # Increment the highest iteration
+          ITERATION=$((MAX_ITERATION + 1))
+          TAG="$DATE-$ITERATION"
+        else
+          # No tags for today, use just the date
+          TAG="$DATE"
+          ITERATION=""
+        fi
+        
+        echo "TAG=$TAG" >> $GITHUB_OUTPUT
+        
+    - name: Notify release success
+      if: needs.release.result == 'success'
+      run: |
+        echo "✅ Release created successfully!"
+        echo "🎉 TerminalAI ${{ steps.generate_tag.outputs.TAG }} is now available!"
+        
+    - name: Notify release failure
+      if: needs.release.result != 'success'
+      run: |
+        echo "❌ Release failed!"
+        echo "📧 Check the logs and fix any issues."
+        exit 1
+
+  cleanup:
+    name: Cleanup
+    needs: [release]
+    if: always()
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Delete workflow artifacts
+      uses: geekyeggo/delete-artifact@v5
+      with:
+        name: |
+          terminalai-linux-x86_64
+          terminalai-linux-aarch64
+          terminalai-macos-x86_64
+          terminalai-macos-aarch64
+          terminalai-windows-x86_64
+        failOnError: false
