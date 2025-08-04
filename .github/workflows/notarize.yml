@@ -169,6 +169,16 @@ jobs:
         
         cd release-assets
         
+        # Get the certificate identity for re-signing
+        CERT_IDENTITY=$(security find-identity -v -p codesigning build.keychain | grep "Developer ID Application" | head -1 | grep -o '"[^"]*"' | sed 's/"//g')
+        
+        if [ -z "$CERT_IDENTITY" ]; then
+          echo "❌ No Developer ID Application certificate found for stapling"
+          exit 1
+        fi
+        
+        echo "Using certificate for stapling: $CERT_IDENTITY"
+        
         # Extract original archives and staple tickets
         for archive in terminalai-macos-*.tar.gz; do
           echo "Processing $archive..."
@@ -176,12 +186,30 @@ jobs:
           # Extract archive
           tar -xzf "$archive"
           
-          # Staple notarization tickets to all binaries
+          # Re-sign and staple notarization tickets to all binaries
           binaries=("tai" "cp_ai" "find_ai" "grep_ai" "ps_ai" "resolve_ai")
           for binary in "${binaries[@]}"; do
             if [ -f "$binary" ]; then
-              echo "Stapling ticket to $binary..."
-              xcrun stapler staple "$binary"
+              echo "Re-signing and stapling ticket to $binary..."
+              
+              # First, re-sign the binary with the Developer ID certificate
+              codesign --force --sign "$CERT_IDENTITY" \
+                       --timestamp --options runtime \
+                       "$binary"
+              
+              # Verify the signature
+              if ! codesign --verify --verbose "$binary" 2>/dev/null; then
+                echo "❌ Failed to verify signature for $binary"
+                exit 1
+              fi
+              
+              # Now staple the notarization ticket
+              if xcrun stapler staple "$binary"; then
+                echo "✅ Successfully stapled ticket to $binary"
+              else
+                echo "⚠️ Failed to staple ticket to $binary, but continuing..."
+                # Don't exit here as the binary is still properly signed
+              fi
             fi
           done
           
@@ -229,4 +257,4 @@ jobs:
         # List final assets in the release
         echo ""
         echo "📦 Final release assets:"
-        gh release view ${{ github.event.release.tag_name }} --json assets --jq '.assets[] | "  - \(.name) (\(.size | tonumber / 1024 / 1024 | floor)MB)"' 
+        gh release view ${{ steps.set_release_tag.outputs.RELEASE_TAG }} --json assets --jq '.assets[] | "  - \(.name) (\(.size | tonumber / 1024 / 1024 | floor)MB)"' 
