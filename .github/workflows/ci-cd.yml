@@ -698,29 +698,11 @@ jobs:
     - name: Update release description
       run: |
         echo "📝 Updating release description with notarization status..."
-        
-        # Get current release body and update it
         current_body=$(gh release view "${{ steps.get_release_tag.outputs.RELEASE_TAG }}" --json body -q .body)
-        
-        # Replace the "notarization in progress" text with "notarized"
         updated_body=$(echo "$current_body" | sed 's/(signed, notarization in progress)/(signed and notarized ✅)/g')
-        
-        # Add notarization completion notice
-        updated_body="$updated_body
-
-### 🔐 Notarization Complete
-
-✅ **macOS binaries are now fully notarized by Apple!**
-
-Download the \`-notarized.tar.gz\` versions for the best security experience:
-- **macOS Intel**: \`terminalai-macos-x86_64-notarized.tar.gz\` (signed and notarized ✅)
-- **macOS Apple Silicon**: \`terminalai-macos-aarch64-notarized.tar.gz\` (signed and notarized ✅)
-
-These binaries will run without any Gatekeeper warnings."
-        
-        # Update the release
-        gh release edit "${{ steps.get_release_tag.outputs.RELEASE_TAG }}" --notes "$updated_body"
-        
+        notice="### 🔐 Notarization Complete\n\n✅ macOS binaries are now fully notarized by Apple!\n\nDownload the -notarized.tar.gz versions for the best security experience:\n- macOS Intel: terminalai-macos-x86_64-notarized.tar.gz (signed and notarized ✅)\n- macOS Apple Silicon: terminalai-macos-aarch64-notarized.tar.gz (signed and notarized ✅)\n\nThese binaries will run without any Gatekeeper warnings."
+        echo -e "$updated_body\n\n$notice" > /tmp/updated_body.txt
+        gh release edit "${{ steps.get_release_tag.outputs.RELEASE_TAG }}" --notes-file /tmp/updated_body.txt
         echo "✅ Release description updated"
       env:
         GH_TOKEN: ${{ github.token }}
