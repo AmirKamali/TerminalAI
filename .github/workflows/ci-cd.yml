@@ -488,10 +488,12 @@ jobs:
     - name: Get release tag from previous job
       id: get_release_tag
       run: |
-        # Get the latest tag (should be the one just created)
-        TAG=$(git tag --sort=-version:refname | head -1)
+        # Get the latest release tag from GitHub API
+        TAG=$(gh api repos/${{ github.repository }}/releases/latest --jq '.tag_name')
         echo "RELEASE_TAG=$TAG" >> $GITHUB_OUTPUT
         echo "Using release tag: $TAG"
+      env:
+        GH_TOKEN: ${{ github.token }}
         
     - name: Download release assets
       run: |
@@ -638,7 +640,13 @@ jobs:
         echo "Using certificate for re-signing: $CERT_IDENTITY"
         
         # Extract original archives and re-sign with Developer ID certificate
+        # Only process original archives, not previously notarized ones
         for archive in terminalai-macos-*.tar.gz; do
+          # Skip already notarized archives
+          if [[ "$archive" == *"-notarized.tar.gz" ]]; then
+            echo "Skipping already notarized archive: $archive"
+            continue
+          fi
           echo "Processing $archive..."
           
           # Extract archive
