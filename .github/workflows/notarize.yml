@@ -18,7 +18,7 @@ jobs:
   notarize:
     name: Notarize macOS Binaries
     runs-on: macos-latest
-    if: contains(github.event.release.body, 'macOS') || contains(github.event.release.name, 'Release')
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.release.body, 'macOS') || contains(github.event.release.name, 'Release')
     permissions:
       contents: write  # needed to download release assets and upload notarized binaries
       id-token: write
