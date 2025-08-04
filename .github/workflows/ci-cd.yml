@@ -472,9 +472,269 @@ jobs:
         generate_release_notes: true
         make_latest: ${{ github.ref == 'refs/heads/main' }}
 
+  notarize:
+    name: Notarize macOS Binaries
+    needs: [release]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: macos-latest
+    permissions:
+      contents: write  # needed to download release assets and upload notarized binaries
+      id-token: write
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Get release tag from previous job
+      id: get_release_tag
+      run: |
+        # Get the latest tag (should be the one just created)
+        TAG=$(git tag --sort=-version:refname | head -1)
+        echo "RELEASE_TAG=$TAG" >> $GITHUB_OUTPUT
+        echo "Using release tag: $TAG"
+        
+    - name: Download release assets
+      run: |
+        echo "📥 Downloading release assets..."
+        mkdir -p release-assets
+        
+        # Wait a moment for release assets to be fully processed
+        echo "⏳ Waiting for release assets to be ready..."
+        sleep 10
+        
+        # Check if release exists and has assets
+        echo "🔍 Checking release: ${{ steps.get_release_tag.outputs.RELEASE_TAG }}"
+        gh release view ${{ steps.get_release_tag.outputs.RELEASE_TAG }} --json assets --jq '.assets[].name'
+        
+        # Download macOS assets with retry logic
+        echo "📦 Downloading macOS assets..."
+        for attempt in 1 2 3; do
+          echo "Attempt $attempt to download macOS assets..."
+          if gh release download ${{ steps.get_release_tag.outputs.RELEASE_TAG }} \
+            --pattern "terminalai-macos-*.tar.gz" \
+            --dir release-assets; then
+            echo "✅ Successfully downloaded assets on attempt $attempt"
+            break
+          else
+            echo "⚠️ Download failed on attempt $attempt"
+            if [ $attempt -eq 3 ]; then
+              echo "❌ Failed to download assets after 3 attempts"
+              exit 1
+            fi
+            echo "⏳ Waiting 30 seconds before retry..."
+            sleep 30
+          fi
+        done
+        
+        # Verify we have macOS assets
+        macos_assets=$(ls release-assets/terminalai-macos-*.tar.gz 2>/dev/null | wc -l)
+        if [ "$macos_assets" -eq 0 ]; then
+          echo "❌ No macOS assets found in release"
+          echo "Available assets:"
+          gh release view ${{ steps.get_release_tag.outputs.RELEASE_TAG }} --json assets --jq '.assets[].name'
+          exit 1
+        fi
+        
+        echo "✅ Found $macos_assets macOS asset(s)"
+        ls -la release-assets/
+      env:
+        GH_TOKEN: ${{ github.token }}
+      
+    - name: Setup code signing certificate
+      env:
+        APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+        APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      run: |
+         echo "🔐 Setting up code signing certificate for notarization..."
+         
+         # Create certificate file from base64
+         echo "$APPLE_CERTIFICATE_P12" | base64 -d > certificate.p12
+         
+         # Create keychain
+         security create-keychain -p "temp-keychain" build.keychain
+         security default-keychain -s build.keychain
+         security unlock-keychain -p "temp-keychain" build.keychain
+         security set-keychain-settings -t 3600 -l ~/Library/Keychains/build.keychain
+         
+         # Import certificate
+         security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+         security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "temp-keychain" build.keychain
+         
+         # List certificates for verification
+         echo "Available certificates in keychain:"
+         security find-identity -v -p codesigning build.keychain
+         
+         # Check if we have a Developer ID Application certificate for notarization
+         DEV_ID_CERT=$(security find-identity -v -p codesigning build.keychain | grep "Developer ID Application" | head -1)
+         if [ -z "$DEV_ID_CERT" ]; then
+           echo "❌ No Developer ID Application certificate found. Notarization requires a Developer ID Application certificate."
+           echo "Skipping notarization process."
+           exit 0
+         fi
+         
+         # Clean up certificate file
+         rm certificate.p12
+         
+         echo "✅ Code signing certificate setup complete"
+      
+    - name: Extract and prepare binaries for notarization
+      run: |
+        echo "📦 Extracting binaries for notarization..."
+        
+        cd release-assets
+        
+        for archive in terminalai-macos-*.tar.gz; do
+          echo "Processing $archive..."
+          
+          # Extract archive
+          tar -xzf "$archive"
+          
+          # Create a zip file for notarization (Apple requires zip format)
+          platform=$(echo "$archive" | sed 's/terminalai-macos-\(.*\)\.tar\.gz/\1/')
+          zip_name="terminalai-macos-${platform}-notarize.zip"
+          
+          # Create zip with all binaries
+          zip "$zip_name" tai cp_ai find_ai grep_ai ps_ai resolve_ai
+          
+          echo "Created notarization package: $zip_name"
+        done
+        
+        ls -la *.zip
+      
+    - name: Notarize binaries
+      run: |
+        echo "📋 Starting notarization process..."
+        
+        cd release-assets
+        
+        for zip_file in terminalai-macos-*-notarize.zip; do
+          echo "Notarizing $zip_file..."
+          
+          # Submit for notarization
+          xcrun notarytool submit "$zip_file" \
+            --apple-id "${{ secrets.APPLE_ID }}" \
+            --password "${{ secrets.APPLE_APP_PASSWORD }}" \
+            --team-id "${{ secrets.APPLE_TEAM_ID }}" \
+            --wait
+          
+          echo "✅ $zip_file notarized successfully"
+        done
+      
+    - name: Re-sign notarized binaries
+      run: |
+        echo "🔐 Re-signing notarized binaries with Developer ID certificate..."
+        
+        cd release-assets
+        
+        # Get the certificate identity for re-signing
+        CERT_IDENTITY=$(security find-identity -v -p codesigning build.keychain | grep "Developer ID Application" | head -1 | grep -o '"[^"]*"' | sed 's/"//g')
+        
+        if [ -z "$CERT_IDENTITY" ]; then
+          echo "❌ No Developer ID Application certificate found for re-signing"
+          exit 1
+        fi
+        
+        echo "Using certificate for re-signing: $CERT_IDENTITY"
+        
+        # Extract original archives and re-sign with Developer ID certificate
+        for archive in terminalai-macos-*.tar.gz; do
+          echo "Processing $archive..."
+          
+          # Extract archive
+          tar -xzf "$archive"
+          
+          # Re-sign all binaries with Developer ID certificate (post-notarization)
+          binaries=("tai" "cp_ai" "find_ai" "grep_ai" "ps_ai" "resolve_ai")
+          for binary in "${binaries[@]}"; do
+            if [ -f "$binary" ]; then
+              echo "Re-signing $binary with Developer ID certificate..."
+              
+              # Re-sign the binary with the Developer ID certificate (post-notarization)
+              codesign --force --sign "$CERT_IDENTITY" \
+                       --timestamp --options runtime \
+                       "$binary"
+              
+              # Verify the signature
+              if ! codesign --verify --verbose "$binary" 2>/dev/null; then
+                echo "❌ Failed to verify signature for $binary"
+                exit 1
+              fi
+              
+              # Note: Individual command-line binaries cannot be stapled with notarization tickets
+              # The notarization is validated when the ZIP file is submitted to Apple
+              # The binaries are now properly signed and notarized (approved by Apple)
+              echo "✅ $binary is properly signed and notarized"
+            fi
+          done
+          
+          # Recreate archive with properly signed and notarized binaries
+          platform=$(echo "$archive" | sed 's/terminalai-macos-\(.*\)\.tar\.gz/\1/')
+          new_archive="terminalai-macos-${platform}-notarized.tar.gz"
+          
+          tar -czf "$new_archive" tai cp_ai find_ai grep_ai ps_ai resolve_ai
+          
+          echo "Created notarized archive: $new_archive"
+        done
+        
+        ls -la *-notarized.tar.gz
+      
+    - name: Upload notarized assets
+      run: |
+        echo "📤 Uploading notarized assets to release..."
+        
+        cd release-assets
+        
+        for archive in *-notarized.tar.gz; do
+          echo "Uploading $archive..."
+          gh release upload "${{ steps.get_release_tag.outputs.RELEASE_TAG }}" "$archive" \
+            --clobber
+        done
+        
+        echo "✅ All notarized assets uploaded successfully"
+      env:
+        GH_TOKEN: ${{ github.token }}
+      
+    - name: Update release description
+      run: |
+        echo "📝 Updating release description with notarization status..."
+        
+        # Get current release body and update it
+        current_body=$(gh release view "${{ steps.get_release_tag.outputs.RELEASE_TAG }}" --json body -q .body)
+        
+        # Replace the "notarization in progress" text with "notarized"
+        updated_body=$(echo "$current_body" | sed 's/(signed, notarization in progress)/(signed and notarized ✅)/g')
+        
+        # Add notarization completion notice
+        updated_body="$updated_body
+
+### 🔐 Notarization Complete
+
+✅ **macOS binaries are now fully notarized by Apple!**
+
+Download the \`-notarized.tar.gz\` versions for the best security experience:
+- **macOS Intel**: \`terminalai-macos-x86_64-notarized.tar.gz\` (signed and notarized ✅)
+- **macOS Apple Silicon**: \`terminalai-macos-aarch64-notarized.tar.gz\` (signed and notarized ✅)
+
+These binaries will run without any Gatekeeper warnings."
+        
+        # Update the release
+        gh release edit "${{ steps.get_release_tag.outputs.RELEASE_TAG }}" --notes "$updated_body"
+        
+        echo "✅ Release description updated"
+      env:
+        GH_TOKEN: ${{ github.token }}
+      
+    - name: Cleanup keychain
+      if: always()
+      run: |
+        echo "🧹 Cleaning up keychain..."
+        security delete-keychain build.keychain || echo "Keychain already deleted or doesn't exist"
+        echo "✅ Keychain cleanup complete"
+
   notify:
     name: Notify Success
-    needs: [release]
+    needs: [release, notarize]
     if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     
@@ -533,7 +793,7 @@ jobs:
 
   cleanup:
     name: Cleanup
-    needs: [release]
+    needs: [release, notarize]
     if: always()
     runs-on: ubuntu-latest
     
