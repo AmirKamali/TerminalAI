@@ -3,6 +3,12 @@ name: Notarize macOS Binaries
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag to notarize'
+        required: true
+        default: '20250804'
 
 env:
   CARGO_TERM_COLOR: always
@@ -21,6 +27,16 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
       
+    - name: Set release tag
+      id: set_release_tag
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          echo "RELEASE_TAG=${{ github.event.inputs.release_tag }}" >> $GITHUB_OUTPUT
+        else
+          echo "RELEASE_TAG=${{ github.event.release.tag_name }}" >> $GITHUB_OUTPUT
+        fi
+        echo "Using release tag: ${{ steps.set_release_tag.outputs.RELEASE_TAG }}"
+    
     - name: Download release assets
       run: |
         echo "📥 Downloading release assets..."
@@ -31,14 +47,14 @@ jobs:
         sleep 10
         
         # Check if release exists and has assets
-        echo "🔍 Checking release: ${{ github.event.release.tag_name }}"
-        gh release view ${{ github.event.release.tag_name }} --json assets --jq '.assets[].name'
+        echo "🔍 Checking release: ${{ steps.set_release_tag.outputs.RELEASE_TAG }}"
+        gh release view ${{ steps.set_release_tag.outputs.RELEASE_TAG }} --json assets --jq '.assets[].name'
         
         # Download macOS assets with retry logic
         echo "📦 Downloading macOS assets..."
         for attempt in 1 2 3; do
           echo "Attempt $attempt to download macOS assets..."
-          if gh release download ${{ github.event.release.tag_name }} \
+          if gh release download ${{ steps.set_release_tag.outputs.RELEASE_TAG }} \
             --pattern "terminalai-macos-*.tar.gz" \
             --dir release-assets; then
             echo "✅ Successfully downloaded assets on attempt $attempt"
@@ -59,7 +75,7 @@ jobs:
         if [ "$macos_assets" -eq 0 ]; then
           echo "❌ No macOS assets found in release"
           echo "Available assets:"
-          gh release view ${{ github.event.release.tag_name }} --json assets --jq '.assets[].name'
+          gh release view ${{ steps.set_release_tag.outputs.RELEASE_TAG }} --json assets --jq '.assets[].name'
           exit 1
         fi
         
@@ -188,7 +204,7 @@ jobs:
         
         for archive in *-notarized.tar.gz; do
           echo "Uploading $archive..."
-          gh release upload "${{ github.event.release.tag_name }}" "$archive" \
+          gh release upload "${{ steps.set_release_tag.outputs.RELEASE_TAG }}" "$archive" \
             --clobber
         done
         
@@ -207,8 +223,8 @@ jobs:
         echo "📦 Notarized binaries have been uploaded to the release."
         echo "🔐 Users can now run the binaries without Gatekeeper warnings."
         echo ""
-        echo "🔗 Release URL: ${{ github.event.release.html_url }}"
-        echo "📋 Release Tag: ${{ github.event.release.tag_name }}"
+        echo "🔗 Release URL: https://github.com/${{ github.repository }}/releases/tag/${{ steps.set_release_tag.outputs.RELEASE_TAG }}"
+        echo "📋 Release Tag: ${{ steps.set_release_tag.outputs.RELEASE_TAG }}"
         
         # List final assets in the release
         echo ""
